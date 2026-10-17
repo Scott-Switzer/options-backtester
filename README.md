@@ -1,15 +1,18 @@
 # options-backtester
 
-Black-Scholes options pricing, implied-volatility surfaces, and strategy backtesting in Python.
+Options pricing model library, implied-volatility surfaces, and strategy backtesting in Python.
 
 ## What it does
 
+- **Model library** (`options_backtester/models.py`): eight pricing models with a unified interface — Black-Scholes, binomial (CRR), trinomial, Monte Carlo, Longstaff-Schwartz (American), Barone-Adesi-Whaley, Heston stochastic volatility, and Bjerksund-Stensland. Pure Python, standard library only.
+- **Blended pricing** (`options_backtester/blender.py`): selects the best model for the option's characteristics (exercise style, time to expiry, path dependency, speed/accuracy tradeoff) and explains why. Optional weighted-blend mode averages multiple models.
 - **Pricing engine** (`options_backtester/black_scholes.py`): European call/put prices and Greeks (delta, gamma, theta, vega, rho). Pure Python, no dependencies.
 - **Implied volatility solver** (`options_backtester/implied_vol.py`): Newton-Raphson with bisection fallback; rejects prices that violate arbitrage bounds.
 - **IV surface** (`options_backtester/surface.py`): builds a strike x expiry volatility grid from quotes and renders 3D surface and smile PNGs (matplotlib).
 - **Backtesting engine** (`options_backtester/backtest.py`): runs strategies against daily option-chain snapshots. Orders cross the spread (buy at ask, sell at bid), pay per-contract commission, settle to intrinsic at expiry, and support delta hedging with the underlying.
 - **Example strategies** (`options_backtester/strategies.py`): long ATM call, delta-hedged short straddle, put spread.
 - **Synthetic data** (`options_backtester/data.py`): geometric-Brownian-motion underlying paths and option chains priced off a parametric vol smile. Everything synthetic is labeled as synthetic in code, CLI output, and results. This is not real market data and is for testing the machinery only.
+- **Cloudflare Worker** (`worker/`): HTTP API exposing the pricing models. POST /price for single-model pricing, POST /blend for smart model selection.
 
 ## Install
 

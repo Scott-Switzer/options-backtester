@@ -158,6 +158,9 @@ async function handleBlend(body) {
   return { model, price: priceWith(model, p), reasoning };
 }
 
+const LANDING_HTML = `<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Options Pricer</title><style>body{font-family:system-ui;max-width:480px;margin:20px auto;padding:0 16px}input,select{width:100%;padding:8px;margin:4px 0;box-sizing:border-box}button{background:#06c;color:#fff;border:none;padding:12px;width:100%;font-size:16px;border-radius:6px}pre{background:#f4f4f4;padding:12px;border-radius:6px;overflow-x:auto}</style></head><body><h2>Options Pricer</h2><label>Spot <input id="S" type="number" value="100"></label><label>Strike <input id="K" type="number" value="100"></label><label>Years to expiry <input id="T" type="number" step="0.01" value="1"></label><label>Rate <input id="r" type="number" step="0.01" value="0.05"></label><label>Vol <input id="s" type="number" step="0.01" value="0.2"></label><label>Type <select id="t"><option value="call">Call</option><option value="put">Put</option></select></label><label>Style <select id="st"><option value="european">European</option><option value="american">American</option></select></label><button onclick="go()">Price it</button><pre id="out">Enter values and tap Price it.</pre><script>async function go(){const b={S:+document.getElementById("S").value,K:+document.getElementById("K").value,T:+document.getElementById("T").value,r:+document.getElementById("r").value,sigma:+document.getElementById("s").value,option_type:document.getElementById("t").value,style:document.getElementById("st").value};const x=await(await fetch("/blend",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)})).json();document.getElementById("out").textContent=JSON.stringify(x,null,2)}</script></body></html>
+`;
+
 export default {
   async fetch(request) {
     const url = new URL(request.url);
@@ -172,6 +175,9 @@ export default {
       }
       if (url.pathname === "/blend" && request.method === "POST") {
         return Response.json(await handleBlend(await request.json()), { headers: cors });
+      }
+      if (url.pathname === "/" && request.method === "GET") {
+        return new Response(LANDING_HTML, { headers: { "Content-Type": "text/html" } });
       }
       return Response.json({ error: "Use POST /price, POST /blend, or GET /models" }, { status: 404, headers: cors });
     } catch (e) {

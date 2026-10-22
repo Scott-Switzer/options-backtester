@@ -1,0 +1,14 @@
+# options-backtester Worker configuration.
+# Not deployed by CI. Deploy manually from this directory: wrangler deploy
+name = "options-backtester"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+
+# Zion thin serving layer. POST /price-by-ticker reads price history
+# through this binding. The token it authorizes with is a secret, set with:
+#   wrangler secret put ZION_SERVING_TOKEN
+# Use the same token the DCF security funnel uses for the serving layer.
+# Without the secret the route fails closed with 503 SERVING_NOT_CONFIGURED.
+[[services]]
+binding = "ZION_FINANCIAL_QUERY"
+service = "zion-financial-serving-v2-thin-staging"

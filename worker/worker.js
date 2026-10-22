@@ -13,6 +13,17 @@
  *    "option_type": "call", "style": "european"|"american",
  *    "speed": 0.5, "blend_mode": false}
  *
+ * POST /price-by-ticker - price from served underlying history
+ *   {"ticker": "AAPL", "date": "2025-09-26", "strike": 250,
+ *    "years_to_expiry": 0.5, "sigma": 0.25, "type": "call"}
+ *   Fetches the spot from the Zion thin serving layer through the
+ *   ZION_FINANCIAL_QUERY service binding, authorized with the
+ *   ZION_SERVING_TOKEN secret. "date" defaults to the latest served
+ *   session; "expiry" (YYYY-MM-DD) may replace "years_to_expiry";
+ *   "sigma" may be omitted, in which case 30-day realized volatility is
+ *   computed from the served history. Without the binding or the secret
+ *   the route fails closed with HTTP 503 SERVING_NOT_CONFIGURED.
+ *
  * GET /models  - list available models
  */
 
@@ -158,11 +169,182 @@ async function handleBlend(body) {
   return { model, price: priceWith(model, p), reasoning };
 }
 
+// ---------- served history (Zion thin serving layer) ----------
+const SERVING_NAME = "zion-financial-serving-v2-thin-staging";
+const SERVING_MAX_PAGES = 25;
+
+function httpError(status, code, message) {
+  const e = new Error(message || code);
+  e.status = status;
+  e.code = code;
+  return e;
+}
+function shiftDate(iso, days) {
+  const d = new Date(iso + "T00:00:00Z");
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+async function fetchServingPage(env, params) {
+  const u = new URL("https://internal/history");
+  for (const [k, v] of Object.entries(params)) {
+    if (v !== undefined && v !== null) u.searchParams.set(k, String(v));
+  }
+  const resp = await env.ZION_FINANCIAL_QUERY.fetch(
+    new Request(u.toString(), { headers: { Authorization: "Bearer " + env.ZION_SERVING_TOKEN } })
+  );
+  const text = await resp.text();
+  let page = null;
+  try { page = JSON.parse(text); } catch { /* keep null */ }
+  if (resp.status !== 200) {
+    const code = page && typeof page.error === "string" ? page.error : null;
+    throw httpError(502, "SERVING_UPSTREAM_ERROR",
+      "Serving layer returned HTTP " + resp.status + (code ? " (" + code + ")" : ""));
+  }
+  if (!page || !Array.isArray(page.rows)) {
+    throw httpError(502, "SERVING_BAD_RESPONSE", "Serving layer returned an unusable history page.");
+  }
+  return page;
+}
+async function fetchServingHistory(env, params) {
+  const query = { limit: 500, ...params };
+  let release = null;
+  const allRows = [];
+  for (let i = 0; i < SERVING_MAX_PAGES; i++) {
+    const page = await fetchServingPage(env, query);
+    if (release !== null && page.input_sha256 !== release) {
+      throw httpError(502, "SERVING_RELEASE_CHANGED", "Serving release changed mid-pagination.");
+    }
+    release = page.input_sha256;
+    allRows.push(...page.rows);
+    if (!page.next) return { ...page, rows: allRows };
+    query.part = page.next.part;
+    query.offset = page.next.offset;
+    if (page.next.expected_input_sha256) {
+      query.expected_input_sha256 = page.next.expected_input_sha256;
+    }
+  }
+  throw httpError(502, "SERVING_PAGINATION_BUDGET", "Serving history pagination exceeded the page budget.");
+}
+function servedSpot(row) {
+  const raw = row.raw_observed_price;
+  if (typeof raw === "number" && Number.isFinite(raw) && raw > 0) {
+    return { spot: raw, basis: "raw_observed_price" };
+  }
+  const adj = row.split_adjusted_price;
+  if (typeof adj === "number" && Number.isFinite(adj) && adj > 0) {
+    return { spot: adj, basis: "split_adjusted_price" };
+  }
+  return null;
+}
+function realizedVol(rows, basis) {
+  const closes = rows.map((row) => row[basis])
+    .filter((v) => typeof v === "number" && Number.isFinite(v) && v > 0)
+    .slice(-31);
+  if (closes.length < 11) return null;
+  const returns = [];
+  for (let i = 1; i < closes.length; i++) returns.push(Math.log(closes[i] / closes[i - 1]));
+  const mean = returns.reduce((a, b) => a + b, 0) / returns.length;
+  const variance = returns.reduce((a, b) => a + (b - mean) * (b - mean), 0) / (returns.length - 1);
+  return Math.sqrt(variance) * Math.sqrt(252);
+}
+
+async function handlePriceByTicker(body, env) {
+  if (!env || !env.ZION_FINANCIAL_QUERY || !env.ZION_SERVING_TOKEN) {
+    throw httpError(503, "SERVING_NOT_CONFIGURED",
+      "POST /price-by-ticker needs the ZION_FINANCIAL_QUERY service binding and the ZION_SERVING_TOKEN secret on this Worker. Neither is set here, so no served price was fetched.");
+  }
+  const ticker = String(body.ticker || "").toUpperCase();
+  if (!/^[A-Z][A-Z0-9.-]{0,24}$/.test(ticker)) {
+    throw httpError(400, "INVALID_TICKER", "A valid ticker is required, for example \"AAPL\".");
+  }
+  const K = body.strike ?? body.K;
+  if (typeof K !== "number" || !Number.isFinite(K) || K <= 0) {
+    throw httpError(400, "INVALID_STRIKE", "strike must be a positive number.");
+  }
+  const optionType = String(body.type || body.option_type || "call").toLowerCase();
+  if (optionType !== "call" && optionType !== "put") {
+    throw httpError(400, "INVALID_TYPE", "type must be \"call\" or \"put\".");
+  }
+  if (body.date !== undefined && !/^\d{4}-\d{2}-\d{2}$/.test(body.date)) {
+    throw httpError(400, "INVALID_DATE", "date must be YYYY-MM-DD.");
+  }
+  if (body.expiry !== undefined && !/^\d{4}-\d{2}-\d{2}$/.test(body.expiry)) {
+    throw httpError(400, "INVALID_EXPIRY", "expiry must be YYYY-MM-DD.");
+  }
+  const meta = await fetchServingPage(env, { symbol: ticker, metadata_only: "true", limit: 1 });
+  const coverage = meta.coverage || {};
+  if (!coverage.date_max) {
+    throw httpError(502, "SERVING_NO_COVERAGE", "Serving layer reported no price coverage for " + ticker + ".");
+  }
+  const endDate = body.date && body.date < coverage.date_max ? body.date : coverage.date_max;
+  const startDate = shiftDate(endDate, -400) > (coverage.date_min || "") ? shiftDate(endDate, -400) : coverage.date_min;
+  const history = await fetchServingHistory(env, { symbol: ticker, date_from: startDate, date_to: endDate });
+  const rows = [...history.rows].sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+  if (!rows.length) {
+    throw httpError(404, "NO_SERVED_PRICE", "No served price for " + ticker + " on or before " + endDate + ".");
+  }
+  const spotRow = rows[rows.length - 1];
+  const spotInfo = servedSpot(spotRow);
+  if (!spotInfo) {
+    throw httpError(502, "SERVED_PRICE_MISSING", "Served row for " + ticker + " on " + spotRow.date + " carries no usable price.");
+  }
+  const { spot, basis } = spotInfo;
+  const priceDate = spotRow.date;
+  let T;
+  if (typeof body.years_to_expiry === "number") T = body.years_to_expiry;
+  else if (body.expiry) T = (Date.parse(body.expiry + "T00:00:00Z") - Date.parse(priceDate + "T00:00:00Z")) / (365 * 86400000);
+  else T = 1.0;
+  if (!Number.isFinite(T) || T <= 0) {
+    throw httpError(400, "INVALID_EXPIRY", "Expiry must fall after the served price date " + priceDate + ".");
+  }
+  const r = body.r ?? body.rate ?? 0.05;
+  const q = body.q ?? body.dividend_yield ?? 0;
+  let sigma = body.sigma;
+  let sigmaSource = "provided";
+  let realized = null;
+  if (typeof sigma !== "number" || !Number.isFinite(sigma) || sigma <= 0) {
+    realized = realizedVol(rows, basis);
+    if (realized === null || !(realized > 0)) {
+      throw httpError(422, "INSUFFICIENT_SERVED_HISTORY",
+        "sigma was not provided and the served history is too short or too flat to compute realized volatility.");
+    }
+    sigma = realized;
+    sigmaSource = "realized_vol_from_served_history";
+  }
+  const provenance = {
+    provider: "CRSP",
+    serving: SERVING_NAME,
+    release: history.input_sha256 || null,
+    permno: history.permno ?? spotRow.permno ?? null,
+    price_date: priceDate,
+    spot,
+    basis,
+  };
+  const priced = { S: spot, K, T, r, q, sigma, option_type: optionType, steps: body.steps || 200 };
+  const out = { ticker, strike: K, years_to_expiry: T, option_type: optionType, sigma, sigma_source: sigmaSource, provenance };
+  if (realized !== null) out.realized_vol_from_served_history = realized;
+  if (body.model) {
+    if (!["black_scholes", "binomial", "baw"].includes(body.model)) {
+      throw httpError(400, "UNKNOWN_MODEL", "model must be one of black_scholes, binomial, baw.");
+    }
+    const style = String(body.style || "european").toLowerCase();
+    out.model = body.model;
+    out.price = priceWith(body.model, { ...priced, american: !!body.american || style === "american" });
+    if (body.model === "black_scholes") out.greeks = bsGreeks(spot, K, T, r, q, sigma, optionType);
+  } else {
+    const blended = await handleBlend({ ...body, ...priced });
+    out.model = blended.model;
+    out.price = blended.price;
+    out.reasoning = blended.reasoning;
+  }
+  return out;
+}
+
 const LANDING_HTML = `<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Options Pricer</title><style>body{font-family:system-ui;max-width:480px;margin:20px auto;padding:0 16px}input,select{width:100%;padding:8px;margin:4px 0;box-sizing:border-box}button{background:#06c;color:#fff;border:none;padding:12px;width:100%;font-size:16px;border-radius:6px}pre{background:#f4f4f4;padding:12px;border-radius:6px;overflow-x:auto}</style></head><body><h2>Options Pricer</h2><label>Spot <input id="S" type="number" value="100"></label><label>Strike <input id="K" type="number" value="100"></label><label>Years to expiry <input id="T" type="number" step="0.01" value="1"></label><label>Rate <input id="r" type="number" step="0.01" value="0.05"></label><label>Vol <input id="s" type="number" step="0.01" value="0.2"></label><label>Type <select id="t"><option value="call">Call</option><option value="put">Put</option></select></label><label>Style <select id="st"><option value="european">European</option><option value="american">American</option></select></label><button onclick="go()">Price it</button><pre id="out">Enter values and tap Price it.</pre><script>async function go(){const b={S:+document.getElementById("S").value,K:+document.getElementById("K").value,T:+document.getElementById("T").value,r:+document.getElementById("r").value,sigma:+document.getElementById("s").value,option_type:document.getElementById("t").value,style:document.getElementById("st").value};const x=await(await fetch("/blend",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)})).json();document.getElementById("out").textContent=JSON.stringify(x,null,2)}</script></body></html>
 `;
 
 export default {
-  async fetch(request) {
+  async fetch(request, env) {
     const url = new URL(request.url);
     const cors = { "Access-Control-Allow-Origin": "*", "Content-Type": "application/json" };
     if (request.method === "OPTIONS") return new Response(null, { headers: cors });
@@ -175,6 +357,15 @@ export default {
       }
       if (url.pathname === "/blend" && request.method === "POST") {
         return Response.json(await handleBlend(await request.json()), { headers: cors });
+      }
+      if (url.pathname === "/price-by-ticker" && request.method === "POST") {
+        try {
+          return Response.json(await handlePriceByTicker(await request.json(), env), { headers: cors });
+        } catch (e) {
+          const out = { error: e.code || e.message };
+          if (e.code) out.message = e.message;
+          return Response.json(out, { status: e.status || 400, headers: cors });
+        }
       }
       if (url.pathname === "/" && request.method === "GET") {
         return new Response(LANDING_HTML, { headers: { "Content-Type": "text/html" } });

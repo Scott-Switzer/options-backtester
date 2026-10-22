@@ -16,6 +16,7 @@ from .black_scholes import (
 )
 from .implied_vol import implied_volatility
 from .backtest import BacktestEngine, BacktestResult
+from .serving import HistoryResult, PriceRow, ServingClient, ServingError
 
 __all__ = [
     "black_scholes_price",
@@ -28,6 +29,10 @@ __all__ = [
     "implied_volatility",
     "BacktestEngine",
     "BacktestResult",
+    "HistoryResult",
+    "PriceRow",
+    "ServingClient",
+    "ServingError",
 ]
 
 __version__ = "0.1.0"
